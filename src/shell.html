@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>포토프랍 PDF 에디터</title>
+<meta name="description" content="이미지로 아크릴 포토프랍 인쇄용 PDF(화이트·칼선·레이어)를 만드는 브라우저 에디터">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M6 2h20a2 2 0 012 2v14a2 2 0 01-2 2h-7v10h-6V20H6a2 2 0 01-2-2V4a2 2 0 012-2z' fill='%23E4EBFF' stroke='%231F4FD8' stroke-width='2'/%3E%3C/svg%3E">
+<style>/*STYLE*/</style>
+</head>
+<body>
+<div class="app">
+<header>
+<div class="ttl"><h1>포토프랍 PDF 에디터</h1><p class="help" id="sub"></p></div>
+<nav class="designs" aria-label="디자인 목록" id="designs"></nav>
+<div class="actions"><button class="btn sub" id="load">작업 불러오기</button><button class="btn sub" id="save">작업 저장</button><button class="btn sub" id="check">검증</button><button class="btn pri" id="export">PDF 내보내기</button></div>
+</header>
+<div class="body">
+<nav class="tools" aria-label="도구" id="tools"></nav>
+<main>
+<div class="viewbar"><div class="views" role="tablist" aria-label="미리보기 종류" id="views"></div>
+<ul class="legend" id="legend" hidden><li><span style="background:#fff"></span>흰색 = 화이트</li><li><span style="background:#FFD84D"></span>노랑 = 반투명(제외)</li><li><span style="background:#000"></span>검정 = 투명</li><li><span style="background:#7A8594"></span>회색 = 불투명인데 화이트 없음</li><li><span style="background:#FF2FB3"></span>분홍 = 화이트가 반투명·투명에 겹침</li></ul></div>
+<div class="stage" id="stage" role="tabpanel" aria-label="미리보기">
+<canvas id="cv" tabindex="0" role="img" aria-label="미리보기"></canvas>
+<div class="v3d" id="v3d" hidden></div>
+<div class="empty" id="empty"><div><h2>이미지를 올려 주세요</h2><p class="help">여기로 끌어다 놓아도 돼요.<br>PNG · JPG · WebP (투명 PNG 권장)</p><button class="btn" id="emptyAdd">이미지 올리기</button></div></div>
+<div class="busy" id="busy" hidden>계산 중…</div>
+</div>
+<div class="status"><span class="selinfo" id="selinfo"></span>
+<span class="zoom"><button class="btn" id="zout">축소</button><output id="zval">100%</output><button class="btn" id="zin">확대</button><button class="btn" id="zfit">화면 맞춤</button></span>
+<button class="warnchip" id="warn" hidden></button></div>
+</main>
+<aside aria-label="속성"><div class="ptabs" role="tablist" aria-label="속성 탭" id="ptabs"></div><div class="panel" id="panel" role="tabpanel"></div></aside>
+</div>
+</div>
+<div class="sr" id="live" aria-live="polite"></div>
+<div id="toasts" role="status"></div>
+<dialog id="report" aria-labelledby="repT"></dialog>
+<input type="file" id="fImg" accept="image/png,image/jpeg,image/webp" multiple hidden><input type="file" id="fJson" accept=".json,application/json" hidden>
+<script id="core">/*CORE*/</script>
+<script id="worker" type="text/plain">/*WORKER*/</script>
+<script>/*APP*/</script>
+</body>
+</html>
