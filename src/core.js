@@ -447,10 +447,13 @@
       const bin = new Uint8Array(N);
       for (let i = 0; i < N; i++) bin[i] = F[i] > 0 ? 1 : 0;
       const { labels, areas } = label(bin, w, h, true), min = wh.minArea * ppm * ppm;
-      for (let i = 0; i < N; i++) if (bin[i] && areas[labels[i]] < min) F[i] = -1;
+      // 보호 영역에 닿은 조각(얇은 글씨 획 등)은 작아도 지우지 않아요.
+      const keep = new Uint8Array(areas.length);
+      for (let i = 0; i < N; i++) if (bin[i] && protect[i]) keep[labels[i]] = 1;
+      for (let i = 0; i < N; i++) if (bin[i] && !keep[labels[i]] && areas[labels[i]] < min) F[i] = -1;
       if (wh.smooth > 0) {
         const bl = boxBlur(F, w, h, Math.round(wh.smooth));
-        for (let i = 0; i < N; i++) F[i] = Math.min(bl[i], F[i]);
+        for (let i = 0; i < N; i++) if (!protect[i]) F[i] = Math.min(bl[i], F[i]);
       }
     }
     for (const op of ops) {
@@ -583,6 +586,30 @@
     const A = W * c, B = -W * s, C = H * s, D = H * c;
     return [A, B, C, D, cx - (A + C) / 2, cy - (B + D) / 2];
   }
+  /** 표준 sRGB(IEC 61966-2.1) 값으로 만든 ICC v2 프로파일 */
+  function srgbIcc() {
+    const ascii = (t) => Array.from(t, (c) => c.charCodeAt(0));
+    const u32 = (v) => [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255];
+    const s15 = (v) => u32(Math.round(v * 65536));
+    const xyz = (...v) => [...ascii('XYZ '), 0, 0, 0, 0, ...v.flatMap(s15)];
+    const name = 'sRGB IEC61966-2.1';
+    const desc = [...ascii('desc'), 0, 0, 0, 0, ...u32(name.length + 1), ...ascii(name), 0, ...Array(4 + 4 + 2 + 1 + 67).fill(0)];
+    const n = 1024, curve = [...ascii('curv'), 0, 0, 0, 0, ...u32(n)];
+    for (let i = 0; i < n; i++) {
+      const x = i / (n - 1), y = Math.round((x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4) * 65535);
+      curve.push(y >> 8, y & 255);
+    }
+    const data = { desc, cprt: [...ascii('text'), 0, 0, 0, 0, ...ascii('Public Domain'), 0], wtpt: xyz(0.9505, 1, 1.0891),
+      rXYZ: xyz(0.43607, 0.22249, 0.01392), gXYZ: xyz(0.38515, 0.71687, 0.09708), bXYZ: xyz(0.14307, 0.06061, 0.7141), rTRC: curve };
+    const tags = [...Object.keys(data), 'gTRC', 'bTRC'], at = {};
+    const body = [], base = 128 + 4 + tags.length * 12;
+    for (const [k, v] of Object.entries(data)) { at[k] = [base + body.length, v.length]; body.push(...v); while (body.length % 4) body.push(0); }
+    at.gTRC = at.bTRC = at.rTRC;
+    const head = [...u32(base + body.length), 0, 0, 0, 0, 2, 0x10, 0, 0, ...ascii('mntrRGB XYZ '), 0x07, 0xd0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0,
+      ...ascii('acsp'), ...Array(28).fill(0), ...s15(0.9642), ...s15(1), ...s15(0.8249)];
+    while (head.length < 128) head.push(0);
+    return new Uint8Array([...head, ...u32(tags.length), ...tags.flatMap((t) => [...ascii(t), ...u32(at[t][0]), ...u32(at[t][1])]), ...body]);
+  }
   /** 빈 이름은 기본값, 중복은 번호 */
   function uniqueNames(list) {
     const used = new Set();
@@ -614,6 +641,7 @@
     const ocgs = names.map((n) => add(`<</Type/OCG/Name ${hexName(n)}/Intent/View/Usage<</CreatorInfo<</Creator(PhotopropEditor)/Subtype/Artwork>>>>>>`));
     const whiteOc = ocgs[0], cutOc = ocgs[ocgs.length - 1];
 
+    const icc = imgs.length ? add('<</N 3/Alternate/DeviceRGB/Filter/FlateDecode>>', await deflate(srgbIcc())) : 0;
     const kids = [], cache = new Map();
     // 같은 원본이 여러 레이어에 쓰이면 픽셀을 한 번만 넣고, 레이어 연결은 BDC로만 해요.
     const ocUse = new Map();
@@ -632,7 +660,7 @@
         props.set(key, oc);
         const src = im.jpeg || im.pixels, ck = src;
         let enced = cache.get(ck);
-        if (!enced) { enced = await encodeImage(im); cache.set(ck, enced); }
+        if (!enced) { enced = await encodeImage(im, `[/ICCBased ${icc} 0 R]`); cache.set(ck, enced); }
         if (enced.smaskDict && !enced.smaskId) enced.smaskId = add(enced.smaskDict, enced.smask);
         if (!enced.id) enced.id = add(enced.dict + (enced.smaskId ? `/SMask ${enced.smaskId} 0 R` : '') + (ocUse.get(ck).size === 1 ? `/OC ${oc} 0 R` : '') + '>>', enced.bytes);
         xobjs.push([name, enced.id]);
@@ -671,9 +699,9 @@
     for (const p of parts) { out.set(p, o); o += p.length; }
     return out;
   }
-  async function encodeImage(im) {
-    const head = (w, h, cs) => `<</Type/XObject/Subtype/Image/Width ${w}/Height ${h}/ColorSpace/${cs}/BitsPerComponent 8`;
-    if (im.jpeg) return { dict: head(im.jpeg.w, im.jpeg.h, 'DeviceRGB') + '/Filter/DCTDecode', bytes: im.jpeg.bytes };
+  async function encodeImage(im, rgbSpace) {
+    const head = (w, h, cs) => `<</Type/XObject/Subtype/Image/Width ${w}/Height ${h}/ColorSpace ${cs}/BitsPerComponent 8`;
+    if (im.jpeg) return { dict: head(im.jpeg.w, im.jpeg.h, rgbSpace) + '/Filter/DCTDecode', bytes: im.jpeg.bytes };
     const { w, h, data } = im.pixels;
     const flate = (ch) => `/Filter/FlateDecode/DecodeParms<</Predictor 15/Colors ${ch}/BitsPerComponent 8/Columns ${w}>>`;
     const rgb = new Uint8Array(w * h * 3), al = new Uint8Array(w * h);
@@ -683,9 +711,9 @@
       al[i] = data[i * 4 + 3];
       if (al[i] < 255) opaque = false;
     }
-    const r = { dict: head(w, h, 'DeviceRGB') + flate(3), bytes: await deflate(pngUp(rgb, w, h, 3)) };
+    const r = { dict: head(w, h, rgbSpace) + flate(3), bytes: await deflate(pngUp(rgb, w, h, 3)) };
     if (!opaque) {
-      r.smaskDict = head(w, h, 'DeviceGray') + flate(1) + '>>';
+      r.smaskDict = head(w, h, '/DeviceGray') + flate(1) + '>>';
       r.smask = await deflate(pngUp(al, w, h, 1));
     }
     return r;
@@ -694,7 +722,7 @@
   const api = {
     makeGrid, gridForCut, pickPpm, toMm, edt, dilate, erode, closing, opening, sdf, label, fillHoles, keepLargest,
     boxBlur, marchingSquares, simplifyClosed, contoursMm, imageAABB, unionBox, rasterAlpha, stickRect,
-    buildCut, buildWhite, verify, checkRaster, resizePixels, buildPdf, imageMatrix, uniqueNames, pngUp, deflate,
+    buildCut, buildWhite, verify, checkRaster, resizePixels, buildPdf, imageMatrix, srgbIcc, uniqueNames, pngUp, deflate,
   };
   root.PhotopropCore = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

@@ -156,6 +156,22 @@ test('수동 보정, 보호 영역, 검증', () => {
   const half = C.resizePixels(sampleImage(64), 0.5); assert.equal(half.w, 32);
 });
 
+test('보호 영역: 작은 조각을 지우지 않고 다듬지 않아요', () => {
+  const n = 400, data = new Uint8ClampedArray(n * n * 4); // 40mm: 0.2mm 폭 2mm 획 두 개(각 0.4mm²)
+  const bar = (x0, y0) => { for (let y = y0; y < y0 + 20; y++) for (let x = x0; x < x0 + 2; x++) data[(y * n + x) * 4 + 3] = 255; };
+  bar(100, 100); bar(300, 300);
+  const go = (ops) => {
+    const d = makeDesign({ white: { ops, smooth: 3, minArea: 0.5 } });
+    d.images = [{ id: 'i', x: 20, y: 10, w: 40, h: 40, rot: 0, pixels: { w: n, h: n, data } }];
+    return run(d, 20).white.loops;
+  };
+  assert.equal(go([]).length, 0);
+  const l = go([{ kind: 'protect-rect', x: 28, y: 18, w: 5, h: 5 }]);
+  assert.equal(l.length, 1, '보호한 획만 남아요');
+  const b = bounds(l[0]);
+  near(b.x1 - b.x0, 0.16, 0.03, '획 폭'); near(b.x0, 30.02, 0.03);
+});
+
 test('이미지 행렬과 알파 래스터가 회전/반전에서 일치해요', () => {
   const n = 64, data = new Uint8ClampedArray(n * n * 4); // 왼쪽 위 1/4만 불투명
   for (let y = 0; y < n / 2; y++) for (let x = 0; x < n / 2; x++) data[(y * n + x) * 4 + 3] = 255;
@@ -189,6 +205,7 @@ test('PDF: 명세 2장 구조', async () => {
   assert.match(txt, /MediaBox\[0 0 226\.77165 396\.85039\]/);
   const names = [...txt.matchAll(/\/OCG\/Name <FEFF([0-9A-F]+)>/g)].map((m) => Buffer.from(m[1], 'hex').swap16().toString('utf16le'));
   assert.deepEqual(names, ['화이트', '이미지', '칼선']);
+  assert.ok(txt.includes('/ColorSpace [/ICCBased '));
   assert.match(txt, /\/SMask \d+ 0 R\/OC \d+ 0 R/);
   // xref 위치 확인
   const xr = +txt.match(/startxref\n(\d+)/)[1];

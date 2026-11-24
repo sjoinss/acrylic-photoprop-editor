@@ -405,7 +405,7 @@
       range('보호 영역 크기 조절', () => w.protectOffset, (v) => { w.protectOffset = round(v); }, { min: -1, max: 1, step: 0.01, disabled: !auto }),
       num('작은 조각 제거 (mm² 미만)', () => w.minArea, (v) => { w.minArea = v; }, { min: 0, max: 100, disabled: !auto }),
       range('가장자리 다듬기', () => w.smooth, (v) => { w.smooth = v; }, { min: 0, max: 3, step: 1, show: (v) => sm[v], disabled: !auto }),
-      sec('얇은 글씨·선 보호', 3), help(`보호 영역 ${prot}개. 이 안에서는 보호 영역 크기 조절 값을 써요.`),
+      sec('얇은 글씨·선 보호', 3), help(`보호 영역 ${prot}개. 이 안에서는 보호 영역 크기 조절 값을 쓰고, 작은 조각 제거와 다듬기를 하지 않아요.`),
       h('div', { class: 'g2' }, btn('붓으로 보호 지정', () => setTool('protect-brush'), { pressed: ui.tool === 'protect-brush', disabled: !auto }), btn('사각형으로 지정', () => setTool('protect-rect'), { pressed: ui.tool === 'protect-rect', disabled: !auto })),
       btn('보호 영역 모두 지우기', () => { w.ops = w.ops.filter((o) => !o.kind.startsWith('protect')); commit(); }, { class: 'danger', disabled: !prot }),
       sec('수동 보정', 3), help(`화이트 추가·지움 ${man}개. 넓은 화면의 왼쪽 도구에서 칠할 수 있어요.`),
