@@ -32,7 +32,7 @@ const handlers = {
     for (const design of designs) {
       const r = pipeline(design, plate, C.pickPpm(plate, 6e6, 20), {});
       reports.push({ id: design.id, ...C.verify(r.d, plate, r.g, r.alpha, r.cut, r.white) });
-      exportMemo.pages.push({ design: r.d, cutLoops: r.cut.loops, whiteLoops: r.white.loops });
+      exportMemo.pages.push({ design: r.d, cutCurves: r.cut.curves, whiteLoops: r.white.loops });
     }
     return { reports };
   },

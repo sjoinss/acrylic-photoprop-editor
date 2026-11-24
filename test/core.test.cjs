@@ -96,6 +96,37 @@ test('칼선: 샘플 치수대로 닫힌 외곽선 1개', () => {
   console.log('  칼선 점 수', l.length, '넓이', area(l).toFixed(3));
 });
 
+test('칼선: 베지어 곡선', () => {
+  const kinds = (c) => [c.segs.filter((x) => x.length === 6).length, c.segs.filter((x) => x.length === 2).length];
+  const st = { on: false };
+  const d0 = run(makeDesign(), 20);
+  assert.deepEqual(kinds(d0.cut.curves[0]), [8, 8], '샘플처럼 곡선 8개, 직선 8개');
+  const exact = bounds(d0.cut.loops[0]);
+  assert.deepEqual([exact.x0, exact.x1, exact.y0, exact.y1].map((v) => +v.toFixed(9)), [6.5, 73.5, 9, 138]);
+  assert.deepEqual(kinds(run(makeDesign({ cut: { shape: 'circle', stick: st } }), 16).cut.curves[0]), [4, 0]);
+  for (const [name, over, rot] of [['따라가기', { shape: 'follow', stick: st }, 0], ['따라가기+막대', { shape: 'follow' }, 0], ['원+막대', { shape: 'circle' }, 0], ['회전 따라가기', { shape: 'follow', stick: st }, 17]]) {
+    const d = makeDesign({ cut: over });
+    Object.assign(d.images[0], { x: 12, y: 12, w: 50, h: 50, rot });
+    if (rot) d.images[0].pixels = { w: 2, h: 2, data: new Uint8ClampedArray(16).fill(255) };
+    const { cut, g } = run(d, 16.7), c = cut.curves[0], k = kinds(c);
+    const f = Float32Array.from(cut.sdf, (v) => -v);
+    const dev = C.maxDeviation(cut.loops[0], C.contoursMm(f, g, 0.005)[0]);
+    console.log('  ', name, '곡선/직선', k, '최대 오차', dev.toFixed(3));
+    assert.equal(cut.curves.length, 1);
+    assert.ok(dev <= 0.1, name); assert.ok(k[0] > 0 && k[0] < 25, name + ' 곡선 수');
+    // 꺾임: 부드러운 원형 이미지에서는 이어지는 접선이 크게 꺾이지 않아야 해요
+    if (name === '따라가기') {
+      let p = c.p, prev = null, worst = 0;
+      for (const s of [...c.segs, c.segs[0]]) {
+        const t0 = [s[0] - p[0], s[1] - p[1]], L = s.length;
+        if (prev && Math.hypot(...t0) > 1e-9) worst = Math.max(worst, Math.abs(Math.atan2(prev[0] * t0[1] - prev[1] * t0[0], prev[0] * t0[0] + prev[1] * t0[1])) * 180 / Math.PI);
+        prev = L === 2 ? t0 : [s[4] - s[2], s[5] - s[3]]; p = s.slice(-2);
+      }
+      assert.ok(worst < 3, '접선 꺾임 ' + worst);
+    }
+  }
+});
+
 test('칼선: 모든 모양 × 막대 방향 × 정렬 안 되는 ppm', () => {
   for (const shape of ['rect', 'roundrect', 'circle', 'follow'])
     for (const side of ['bottom', 'top', 'left', 'right'])
@@ -195,7 +226,7 @@ test('PDF: 명세 2장 구조', async () => {
   const t0 = performance.now();
   const { cut, white } = run(d, C.pickPpm(plate, 6e6, 20));
   const t1 = performance.now();
-  const pdf = await C.buildPdf({ plate, layers, pages: [{ design: d, cutLoops: cut.loops, whiteLoops: white.loops }] });
+  const pdf = await C.buildPdf({ plate, layers, pages: [{ design: d, cutCurves: cut.curves, whiteLoops: white.loops }] });
   console.log(`  계산 ${(t1 - t0).toFixed(0)}ms, PDF ${(performance.now() - t1).toFixed(0)}ms, ${(pdf.length / 1024).toFixed(0)}KB`);
   const out = path.join(__dirname, 'out');
   fs.mkdirSync(out, { recursive: true });
@@ -227,7 +258,7 @@ test('PDF: 여러 페이지 + 이미지별 레이어 + 불투명 이미지', asy
   b.images[0].id = 'i2';
   const px = { w: 4, h: 4, data: new Uint8ClampedArray(64).fill(255) };
   b.images.push({ id: 'i3', x: 10, y: 12, w: 10, h: 10, rot: 30, flipH: true, pixels: px });
-  const pages = [a, b].map((design) => { const r = run(design, 8); return { design, cutLoops: r.cut.loops, whiteLoops: r.white.loops }; });
+  const pages = [a, b].map((design) => { const r = run(design, 8); return { design, cutCurves: r.cut.curves, whiteLoops: r.white.loops }; });
   const pdf = await C.buildPdf({ plate, pages, layers: { white: '화이트', cut: '칼선', imageMode: 'perImage', imageNames: { i1: '앞', i2: '앞' } } });
   fs.writeFileSync(path.join(__dirname, 'out', 'multi.pdf'), pdf);
   const txt = Buffer.from(pdf).toString('latin1');

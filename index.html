@@ -508,8 +508,9 @@ dialog h2{margin:0;font-size:20px}
   /** 반환: { mask, sdf, loops(mm), removed } */
   function buildCut(design, plate, g, alpha) {
     const cut = design.cut, { w, h } = g;
+    let exact = null;
     let mask = new Uint8Array(w * h);
-    if (!design.images.length) return { mask, sdf: sdf(mask, w, h), loops: [], removed: 0, removedBoxes: [] };
+    if (!design.images.length) return { mask, sdf: sdf(mask, w, h), loops: [], curves: [], removed: 0, removedBoxes: [] };
     if (cut.shape === 'follow') {
       for (let i = 0; i < mask.length; i++) mask[i] = alpha[i] >= 0.08 ? 1 : 0;
       mask = dilate(mask, w, h, cut.margin * g.ppm);
@@ -521,11 +522,13 @@ dialog h2{margin:0;font-size:20px}
         const rx = (box.x1 - box.x0) / 2, ry = (box.y1 - box.y0) / 2;
         for (let y = 0; y < h; y++) for (let x = 0; x < w; x++)
           if (((toMm(g, x) - cx) / rx) ** 2 + ((toMm(g, y) - cy) / ry) ** 2 <= 1) mask[y * w + x] = 1;
+        if (!cut.stick || !cut.stick.on) exact = ellipseCurve(box);
       } else {
         const min = (v) => Math.max(0.5, v || 0);
         const r = cut.shape === 'rect' ? { tl: 0.5, tr: 0.5, br: 0.5, bl: 0.5 }
           : { tl: min(cut.radii.tl), tr: min(cut.radii.tr), br: min(cut.radii.br), bl: min(cut.radii.bl) };
         paintRoundRect(mask, g, box, r);
+        exact = analyticCut(box, r, cut.stick, plate);
       }
     }
     const body = maskBox(mask, g), st = cut.stick;
@@ -541,7 +544,181 @@ dialog h2{margin:0;font-size:20px}
     const s = boxBlur(boxBlur(raw, w, h, 1), w, h, 1);
     const inner = new Float32Array(s.length);
     for (let i = 0; i < s.length; i++) inner[i] = -s[i];
-    return { mask: kept.mask, sdf: s, loops: contoursMm(inner, g, 0.01), removed: kept.removed, removedBoxes: kept.boxes.map((b) => boxMm(g, b)) };
+    const mmLoops = (f) => marchingSquares(f, w, h).map((l) => l.map(([x, y]) => [toMm(g, x), toMm(g, y)]));
+    const raw1 = mmLoops(inner);
+    // 곡선 맞추기용: 거리장을 조금 더 흐려 계단 노이즈를 없애요(반경 1mm 모서리에서 이동량 약 0.01mm).
+    const soft = exact ? raw1 : mmLoops(boxBlur(boxBlur(inner, w, h, 2), w, h, 2));
+    const curves = raw1.map((l) => cutCurve(l, exact, g.ppm, soft.length === raw1.length && raw1.length === 1 ? soft[0] : l));
+    return { mask: kept.mask, sdf: s, curves, loops: curves.map(flattenCurve), removed: kept.removed, removedBoxes: kept.boxes.map((b) => boxMm(g, b)) };
+  }
+
+  // ---------- 칼선 곡선(베지어) ----------
+  // 곡선 1개 = { p: [x, y], segs: [[x, y] | [x1, y1, x2, y2, x, y], ...] } (닫힘, 마지막 점 = p)
+  const KAPPA = 0.5522847498;
+  const segEnd = (s) => s.slice(-2);
+  function flattenCurve(cv) {
+    const out = [cv.p.slice()];
+    let p = cv.p;
+    for (const s of cv.segs) {
+      if (s.length === 2) out.push(s.slice());
+      else {
+        const len = Math.hypot(s[0] - p[0], s[1] - p[1]) + Math.hypot(s[2] - s[0], s[3] - s[1]) + Math.hypot(s[4] - s[2], s[5] - s[3]);
+        const n = Math.max(8, Math.min(400, Math.ceil(len / 0.1)));
+        for (let i = 1; i <= n; i++) {
+          const t = i / n, u = 1 - t;
+          out.push([0, 1].map((k) => u * u * u * p[k] + 3 * u * u * t * s[k] + 3 * u * t * t * s[2 + k] + t * t * t * s[4 + k]));
+        }
+      }
+      p = segEnd(s);
+    }
+    out.pop(); // 시작점과 같은 점
+    return out;
+  }
+  /** 축에 나란한 꼭짓점 + 반경 → 직선과 모서리 곡선 */
+  function roundedPolygon(v) {
+    const n = v.length, segs = [];
+    const dir = (a, b) => { const d = Math.hypot(b[0] - a[0], b[1] - a[1]); return [(b[0] - a[0]) / d, (b[1] - a[1]) / d]; };
+    let start = null;
+    for (let i = 0; i < n; i++) {
+      const [x, y, r] = v[i], a = dir(v[(i + n - 1) % n], v[i]), b = dir(v[i], v[(i + 1) % n]);
+      const s = [x - a[0] * r, y - a[1] * r], e = [x + b[0] * r, y + b[1] * r], k = r * (1 - KAPPA);
+      if (!start) start = s; else segs.push(s);
+      if (r > 0) segs.push([x - a[0] * k, y - a[1] * k, x + b[0] * k, y + b[1] * k, ...e]);
+    }
+    segs.push(start.slice());
+    return { p: start, segs };
+  }
+  /** 치수에서 바로 구할 수 있는 모양이면 정확한 곡선, 아니면 null */
+  function analyticCut(box, r, st, plate) {
+    const max = Math.min(box.x1 - box.x0, box.y1 - box.y0) / 2, R = (v) => Math.min(v, max);
+    // 꼭짓점 순서: 왼쪽 위 → 오른쪽 위 → 오른쪽 아래 → 왼쪽 아래
+    const c = [[box.x0, box.y0, R(r.tl)], [box.x1, box.y0, R(r.tr)], [box.x1, box.y1, R(r.br)], [box.x0, box.y1, R(r.bl)]];
+    if (!st || !st.on) return roundedPolygon(c);
+    const s = stickRect(st, box, plate), b = s.box, j = st.jointRadius;
+    const er = st.endStyle === 'square' ? 0 : Math.min(st.endRadius, st.width / 2);
+    const side = { top: 0, right: 1, bottom: 2, left: 3 }[st.side];
+    const bodyEdge = { top: box.y0, right: box.x1, bottom: box.y1, left: box.x0 }[st.side];
+    const tip = { top: b.y0, right: b.x1, bottom: b.y1, left: b.x0 }[st.side];
+    const horiz = side % 2 === 1, sign = side === 0 || side === 3 ? -1 : 1;
+    const lo = horiz ? b.y0 : b.x0, hi = horiz ? b.y1 : b.x1;
+    const A = c[side], B = c[(side + 1) % 4], ax = horiz ? 1 : 0;
+    const fwd = B[ax] > A[ax], first = fwd ? lo : hi, second = fwd ? hi : lo;
+    // 이음부·모서리·끝 곡선이 서로 겹치지 않을 때만
+    if ((tip - bodyEdge) * sign < j + er + 1e-6) return null;
+    if (Math.abs(first - A[ax]) < A[2] + j + 1e-6 || Math.abs(B[ax] - second) < B[2] + j + 1e-6) return null;
+    if (lo < Math.min(A[ax], B[ax]) || hi > Math.max(A[ax], B[ax])) return null;
+    const pt = (along, across, rad) => (horiz ? [across, along, rad] : [along, across, rad]);
+    c.splice(side + 1, 0, pt(first, bodyEdge, j), pt(first, tip, er), pt(second, tip, er), pt(second, bodyEdge, j));
+    return roundedPolygon(c);
+  }
+  function ellipseCurve(b) {
+    const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2, rx = (b.x1 - b.x0) / 2, ry = (b.y1 - b.y0) / 2, kx = rx * KAPPA, ky = ry * KAPPA;
+    return { p: [cx, b.y0], segs: [
+      [cx + kx, b.y0, b.x1, cy - ky, b.x1, cy], [b.x1, cy + ky, cx + kx, b.y1, cx, b.y1],
+      [cx - kx, b.y1, b.x0, cy + ky, b.x0, cy], [b.x0, cy - ky, cx - kx, b.y0, cx, b.y0]] };
+  }
+  /** 점열에 3차 베지어를 맞춰요(Schneider). t0/t1은 양 끝에서 안쪽을 향하는 단위 접선. */
+  function fitBezier(pts, t0, t1, tol, win) {
+    const out = [], stack = [[0, pts.length - 1, t0, t1]];
+    const bez = (p0, c, p3, t) => { const u = 1 - t; return [0, 1].map((k) => u * u * u * p0[k] + 3 * u * u * t * c[k] + 3 * u * t * t * c[2 + k] + t * t * t * p3[k]); };
+    while (stack.length) {
+      const [a, b, ta, tb] = stack.pop(), p0 = pts[a], p3 = pts[b];
+      if (b - a < 2) { out.push([p3[0], p3[1]]); continue; }
+      const U = [0];
+      for (let i = a + 1; i <= b; i++) U.push(U[U.length - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+      const total = U[U.length - 1], chord = Math.hypot(p3[0] - p0[0], p3[1] - p0[1]);
+      for (let i = 0; i < U.length; i++) U[i] /= total;
+      let c, err, at;
+      for (let iter = 0; iter < 6; iter++) {
+        let c00 = 0, c01 = 0, c11 = 0, x0 = 0, x1 = 0;
+        for (let i = 0; i < U.length; i++) {
+          const t = U[i], u = 1 - t, b1 = 3 * u * u * t, b2 = 3 * u * t * t, b03 = u * u * u + b1, b33 = t * t * t + b2;
+          const dx = pts[a + i][0] - p0[0] * b03 - p3[0] * b33, dy = pts[a + i][1] - p0[1] * b03 - p3[1] * b33;
+          c00 += b1 * b1; c01 += b1 * b2 * (ta[0] * tb[0] + ta[1] * tb[1]); c11 += b2 * b2;
+          x0 += b1 * (ta[0] * dx + ta[1] * dy); x1 += b2 * (tb[0] * dx + tb[1] * dy);
+        }
+        const det = c00 * c11 - c01 * c01;
+        let l = (x0 * c11 - x1 * c01) / det, r = (c00 * x1 - c01 * x0) / det;
+        if (!(l > 1e-4 * chord && r > 1e-4 * chord && l < total && r < total)) l = r = total / 3;
+        c = [p0[0] + ta[0] * l, p0[1] + ta[1] * l, p3[0] + tb[0] * r, p3[1] + tb[1] * r];
+        err = 0; at = (a + b) >> 1;
+        for (let i = 1; i < U.length - 1; i++) {
+          const q = bez(p0, c, p3, U[i]), e = Math.hypot(q[0] - pts[a + i][0], q[1] - pts[a + i][1]);
+          if (e > err) { err = e; at = a + i; }
+        }
+        if (err <= tol) break;
+        for (let i = 1; i < U.length - 1; i++) { // 매개변수 보정(Newton)
+          const t = U[i], u = 1 - t, q = bez(p0, c, p3, t), P = pts[a + i];
+          let f = 0, g = 0;
+          for (let k = 0; k < 2; k++) {
+            const d1 = 3 * (u * u * (c[k] - p0[k]) + 2 * u * t * (c[2 + k] - c[k]) + t * t * (p3[k] - c[2 + k]));
+            const d2 = 6 * (u * (c[2 + k] - 2 * c[k] + p0[k]) + t * (p3[k] - 2 * c[2 + k] + c[k]));
+            f += (q[k] - P[k]) * d1; g += d1 * d1 + (q[k] - P[k]) * d2;
+          }
+          if (g) U[i] = Math.max(0, Math.min(1, t - f / g));
+        }
+      }
+      if (err <= tol) { out.push([...c, p3[0], p3[1]]); continue; }
+      at = Math.max(a + 1, Math.min(b - 1, at));
+      const w = Math.min(win, at - a, b - at), m = tangent(pts[at - w], pts[at + w]);
+      stack.push([at, b, m, tb], [a, at, ta, [-m[0], -m[1]]]);
+    }
+    return out;
+  }
+  function tangent(a, b) { const d = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1; return [(b[0] - a[0]) / d, (b[1] - a[1]) / d]; }
+  /** 촘촘한 윤곽선 → 직선 + 베지어 */
+  function fitCurve(dense, ppm) {
+    // 이진 마스크 윤곽의 흔들림(약 1px)은 따라가지 않도록 해상도에 맞춘 허용 오차
+    const tol = Math.max(0.06, 1 / ppm), win = Math.max(6, Math.round(1.0 * ppm));
+    const n = dense.length, corner = simplifyClosed(dense, 0.03);
+    const idx = new Map(dense.map((p, i) => [p, i])), lines = [];
+    for (let i = 0; i < corner.length; i++) {
+      const a = corner[i], b = corner[(i + 1) % corner.length];
+      if (Math.hypot(b[0] - a[0], b[1] - a[1]) >= 6) lines.push([idx.get(a), idx.get(b)]);
+    }
+    const P = dense.map((p) => p.slice());
+    for (const [a, b] of lines) for (const k of [0, 1]) if (Math.abs(P[a][k] - P[b][k]) < 0.012) P[a][k] = P[b][k] = (P[a][k] + P[b][k]) / 2;
+    const run = (a, b) => { const r = [P[a]]; for (let i = a; i !== b;) { i = (i + 1) % n; r.push(P[i]); } return r; };
+    const neg = (v) => [-v[0], -v[1]], mid = (i) => tangent(dense[(i + n - win) % n], dense[(i + win) % n]);
+    const segs = [];
+    if (!lines.length) {
+      const h = n >> 1, t0 = mid(0), t1 = mid(h);
+      segs.push(...fitBezier(run(0, h), t0, neg(t1), tol, win), ...fitBezier(run(h, 0), t1, neg(t0), tol, win));
+      return { p: P[0].slice(), segs };
+    }
+    lines.forEach(([a, b], i) => {
+      const [c, d] = lines[(i + 1) % lines.length];
+      segs.push(P[b].slice());
+      if (b !== c) segs.push(...fitBezier(run(b, c), tangent(P[a], P[b]), neg(tangent(P[c], P[d])), tol, win));
+    });
+    return { p: P[lines[0][0]].slice(), segs };
+  }
+  /** 두 닫힌 점열의 최대 거리(양방향, 촘촘하다고 가정한 쪽의 점 → 상대 선분) */
+  function maxDeviation(a, b) {
+    const one = (u, v) => {
+      let worst = 0;
+      for (const [x, y] of u) {
+        let best = Infinity;
+        for (let i = 0; i < v.length && best > 1e-6; i++) {
+          const p = v[i], q = v[i + 1 === v.length ? 0 : i + 1], dx = q[0] - p[0], dy = q[1] - p[1], l = dx * dx + dy * dy;
+          let t = l ? ((x - p[0]) * dx + (y - p[1]) * dy) / l : 0;
+          t = t < 0 ? 0 : t > 1 ? 1 : t;
+          const d = (x - p[0] - t * dx) ** 2 + (y - p[1] - t * dy) ** 2;
+          if (d < best) best = d;
+        }
+        if (best > worst) worst = best;
+      }
+      return Math.sqrt(worst);
+    };
+    return Math.max(one(a, b), one(b, a));
+  }
+  const polyCurve = (l) => ({ p: l[0].slice(), segs: [...l.slice(1), l[0]].map((q) => q.slice()) });
+  /** dense: 마스크에서 뽑은 윤곽선. 곡선이 여기서 tol보다 벗어나면 다음 방법을 써요. */
+  function cutCurve(dense, exact, ppm, soft = dense) {
+    const simple = simplifyClosed(dense, 0.01);
+    if (exact && maxDeviation(flattenCurve(exact), simple) <= Math.max(0.06, 1.5 / ppm)) return exact;
+    const fit = fitCurve(soft, ppm);
+    return maxDeviation(flattenCurve(fit), simple) <= Math.max(0.08, 1.6 / ppm) ? fit : polyCurve(simple);
   }
 
   // ---------- 화이트 ----------
@@ -769,7 +946,13 @@ dialog h2{margin:0;font-size:20px}
     });
   }
 
-  /** pages: [{ design, cutLoops, whiteLoops }], design.images[].pixels 또는 .jpeg({w,h,bytes}) */
+  function curveOps(curves, plateH) {
+    const xy = (s) => s.map((v, i) => fmt((i % 2 ? plateH - v : v) * K)).join(' ');
+    return curves.map((c) => [xy(c.p) + ' m', ...c.segs.slice(0, -1).map((s) => xy(s) + (s.length === 2 ? ' l' : ' c')),
+      ...(c.segs[c.segs.length - 1].length === 6 ? [xy(c.segs[c.segs.length - 1]) + ' c'] : []), 'h'].join('\n')).join('\n');
+  }
+
+  /** pages: [{ design, cutCurves, whiteLoops }], design.images[].pixels 또는 .jpeg({w,h,bytes}) */
   async function buildPdf({ plate, layers, pages }) {
     const enc = new TextEncoder(), objs = [null];
     const alloc = () => objs.push(null) - 1;
@@ -797,7 +980,7 @@ dialog h2{margin:0;font-size:20px}
       ocUse.set(k, (ocUse.get(k) || new Set()).add(merged ? ocgs[1] : ocgs[1 + i]));
     });
     let n = 0;
-    for (const { design, cutLoops, whiteLoops } of pages) {
+    for (const { design, cutCurves, whiteLoops } of pages) {
       const props = new Map([['OCW', whiteOc], ['OCC', cutOc]]), xobjs = [];
       let cs = '';
       if (whiteLoops.length) cs += `/OC /OCW BDC\nq\n${colorOp(design.white.color, false)}\n${pathOps(whiteLoops, plate.h)}\nf*\nQ\nEMC\n`;
@@ -813,7 +996,7 @@ dialog h2{margin:0;font-size:20px}
         xobjs.push([name, enced.id]);
         cs += `/OC /${key} BDC\nq\n${imageMatrix(im, plate.h).map(fmt).join(' ')} cm\n/${name} Do\nQ\nEMC\n`;
       }
-      if (cutLoops.length) cs += `/OC /OCC BDC\nq\n${colorOp(design.cut.color, true)}\n${fmt(design.cut.strokeMm * K)} w\n${pathOps(cutLoops, plate.h)}\nS\nQ\nEMC\n`;
+      if (cutCurves.length) cs += `/OC /OCC BDC\nq\n${colorOp(design.cut.color, true)}\n${fmt(design.cut.strokeMm * K)} w\n${curveOps(cutCurves, plate.h)}\nS\nQ\nEMC\n`;
       const content = add('<</Filter/FlateDecode>>', await deflate(enc.encode(cs)));
       kids.push(add(`<</Type/Page/Parent ${tree} 0 R/MediaBox[0 0 ${fmt(plate.w * K)} ${fmt(plate.h * K)}]/Contents ${content} 0 R/Resources<<` +
         `/Properties<<${[...props].map(([k, v]) => `/${k} ${v} 0 R`).join('')}>>` +
@@ -869,7 +1052,7 @@ dialog h2{margin:0;font-size:20px}
   const api = {
     makeGrid, gridForCut, pickPpm, toMm, edt, dilate, erode, closing, opening, sdf, label, fillHoles, keepLargest,
     boxBlur, marchingSquares, simplifyClosed, contoursMm, imageAABB, unionBox, rasterAlpha, stickRect,
-    buildCut, buildWhite, verify, checkRaster, resizePixels, buildPdf, imageMatrix, srgbIcc, uniqueNames, pngUp, deflate,
+    flattenCurve, maxDeviation, buildCut, buildWhite, verify, checkRaster, resizePixels, buildPdf, imageMatrix, srgbIcc, uniqueNames, pngUp, deflate,
   };
   root.PhotopropCore = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
@@ -909,7 +1092,7 @@ const handlers = {
     for (const design of designs) {
       const r = pipeline(design, plate, C.pickPpm(plate, 6e6, 20), {});
       reports.push({ id: design.id, ...C.verify(r.d, plate, r.g, r.alpha, r.cut, r.white) });
-      exportMemo.pages.push({ design: r.d, cutLoops: r.cut.loops, whiteLoops: r.white.loops });
+      exportMemo.pages.push({ design: r.d, cutCurves: r.cut.curves, whiteLoops: r.white.loops });
     }
     return { reports };
   },
