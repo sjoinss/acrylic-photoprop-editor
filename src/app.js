@@ -31,7 +31,7 @@
       color: { space: 'rgb', v: [1, 0, 0] },
       stick: { on: false, side: 'bottom', pos: 'center', width: 12, toEnd: true, length: 30, endRadius: 3, endStyle: 'round', jointRadius: 1, edgeMargin: 2 },
     },
-    white: { mode: 'auto', color: { space: 'cmyk', v: [1, 0, 0, 0] }, sizeOffset: -0.06, opaqueThreshold: 0.96, protectOffset: -0.02, minArea: 0.3, smooth: 1, ops: [] },
+    white: { mode: 'auto', color: { space: 'cmyk', v: [1, 0, 0, 0] }, sizeOffset: -0.06, opaqueThreshold: 0.96, minAlpha: 0.1, toneSteps: 6, protectOffset: -0.02, minArea: 0.3, smooth: 1, ops: [] },
   });
   let P = {
     version: 1, plate: { w: 80, h: 140, gridStep: 5, snap: true, safeMargin: 2 }, designs: [newDesign()],
@@ -110,14 +110,14 @@
       const r = await call('preview', { design: D(), plate: P.plate, wantCheck: ui.view === 'check' });
       if (my === gen && !dragging) {
         result = r;
-        r.cutPath = toPath(r.cut); r.whitePath = toPath(r.white);
+        r.cutPath = toPath(r.cut); r.whiteBands = toBands(r.levels);
         if (r.check) {
           r.checkCv = h('canvas', { width: r.g.w, height: r.g.h });
           r.checkCv.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(r.check), r.g.w, r.g.h), 0, 0);
         }
         if (ui.view === '3d') build3d();
       }
-    } catch (e) { if (my === gen) { result = { cut: [], white: [], removed: 0, removedBoxes: [], cutPath: new Path2D(), whitePath: new Path2D() }; toast('✕ 계산하지 못했어요: ' + e.message, true, schedule); } }
+    } catch (e) { if (my === gen) { result = { cut: [], white: [], removed: 0, removedBoxes: [], cutPath: new Path2D(), whiteBands: [] }; toast('✕ 계산하지 못했어요: ' + e.message, true, schedule); } }
     running = false;
     busy(); draw(); renderStatus();
     if (again || my !== gen) compute();
@@ -126,6 +126,16 @@
     const p = new Path2D();
     for (const l of loops) { l.forEach(([x, y], i) => (i ? p.lineTo(x, y) : p.moveTo(x, y))); p.closePath(); }
     return p;
+  }
+
+  /** full: 단계 전체(포개 칠하기용), ring: 위 단계를 뺀 고리(반투명으로 겹치지 않게 칠하기용) */
+  function toBands(levels) {
+    return levels.map((l, i) => ({ density: l.density, full: toPath(l.loops), ring: toPath(levels[i + 1] ? l.loops.concat(levels[i + 1].loops) : l.loops) }));
+  }
+  function fillWhite(c, r) {
+    c.save(); c.fillStyle = '#fff';
+    for (const b of r.whiteBands) { c.globalAlpha = b.density; c.fill(b.ring, 'evenodd'); }
+    c.restore();
   }
 
   // ---------- 이미지 올리기 ----------
@@ -391,17 +401,25 @@
     return out;
   }
   function panelWhite() {
-    const w = D().white, auto = w.mode === 'auto', none = w.mode === 'none';
+    const w = D().white, tone = w.mode === 'tone', auto = tone || w.mode === 'auto', none = w.mode === 'none';
     const sm = ['없음', '보통', '부드럽게', '아주 부드럽게'];
     const prot = w.ops.filter((o) => o.kind.startsWith('protect')).length, man = w.ops.length - prot;
     const out = [sec('화이트 만들기'),
-      seg('화이트 방식', [['none', '없음'], ['full', '전체 채움'], ['auto', '자동']], () => w.mode, (v) => { w.mode = v; })];
+      seg('화이트 방식', [['none', '없음'], ['full', '전체 채움'], ['auto', '자동'], ['tone', '투명도별']], () => w.mode, (v) => { w.mode = v; })];
     if (none) out.push(help('화이트를 만들지 않아요. 아래 설정은 전체 채움이나 자동에서 쓸 수 있어요.'));
+    if (tone) {
+      out.push(help('이미지가 투명할수록 화이트를 옅게 넣어요. 화이트는 이미지나 투명 효과 없이 벡터 면으로만 들어가서, 포함(임베드)할 링크 이미지가 없어요.'),
+        range('농도 단계', () => w.toneSteps, (v) => { w.toneSteps = v; }, { min: 2, max: 10, step: 1, show: (v) => v + ' 단계' }),
+        range('화이트 시작 불투명도', () => Math.round(w.minAlpha * 100), (v) => { w.minAlpha = v / 100; }, { min: 3, max: 45, step: 1, show: (v) => v + ' %' }),
+        help('이 값보다 투명한 부분은 화이트를 넣지 않고, "불투명 기준" 이상은 100%로 넣어요.'),
+        help('농도: ' + C.toneSteps(w).map((s) => Math.round(s.density * 100) + '%').join(' · ')),
+        help('인쇄소가 옅은 화이트 색(예: C50)을 농도로 읽는지 먼저 확인해 주세요.'));
+    }
     out.push(...color('화이트 색상 (PDF 안의 색)', w.color, '기본: C100'),
       help('인쇄소마다 화이트로 읽는 색이 달라서 자유롭게 바꿀 수 있어요. 올댓프린팅 기본값은 C100이에요.'),
       btn('기본값(C100)으로 되돌리기', () => { w.color = { space: 'cmyk', v: [1, 0, 0, 0] }; commit(); }),
       range('화이트 크기 조절', () => w.sizeOffset, (v) => { w.sizeOffset = round(v); }, { min: -1, max: 1, step: 0.01, disabled: none }), help('마이너스는 줄이기, 플러스는 키우기예요.'),
-      range('불투명 기준', () => Math.round(w.opaqueThreshold * 100), (v) => { w.opaqueThreshold = v / 100; }, { min: 50, max: 100, step: 1, show: (v) => v + ' %', disabled: !auto }), help('불투명도가 이 값 이상인 부분만 화이트가 돼요.'),
+      range('불투명 기준', () => Math.round(w.opaqueThreshold * 100), (v) => { w.opaqueThreshold = v / 100; }, { min: 50, max: 100, step: 1, show: (v) => v + ' %', disabled: !auto }), help(tone ? '불투명도가 이 값 이상이면 화이트를 100%로 넣어요.' : '불투명도가 이 값 이상인 부분만 화이트가 돼요.'),
       range('보호 영역 크기 조절', () => w.protectOffset, (v) => { w.protectOffset = round(v); }, { min: -1, max: 1, step: 0.01, disabled: !auto }),
       num('작은 조각 제거 (mm² 미만)', () => w.minArea, (v) => { w.minArea = v; }, { min: 0, max: 100, disabled: !auto }),
       range('가장자리 다듬기', () => w.smooth, (v) => { w.smooth = v; }, { min: 0, max: 3, step: 1, show: (v) => sm[v], disabled: !auto }),
@@ -463,7 +481,7 @@
   }
   function renderTools() {
     const act = document.activeElement, key = $('tools').contains(act) ? act.dataset.k : null;
-    const usable = (k) => k === 'move' || (D().white.mode === 'auto' || (D().white.mode === 'full' && !k.startsWith('protect')));
+    const usable = (k) => k === 'move' || (['auto', 'tone'].includes(D().white.mode) || (D().white.mode === 'full' && !k.startsWith('protect')));
     if (!usable(ui.tool)) ui.tool = 'move';
     $('tools').replaceChildren(...TOOLS.map(([k, t]) => h('button', { class: 'tool', 'aria-pressed': String(ui.tool === k), disabled: !usable(k), 'data-k': k, title: usable(k) ? t : '화이트 방식이 맞을 때 쓸 수 있어요', onclick: () => setTool(k) }, svg(ICON[k], k.startsWith('protect')), t)),
       h('label', { class: 'fld' }, '붓 크기(mm)', h('input', { type: 'number', min: 0.1, max: 30, step: 0.1, value: ui.brush, 'data-k': 'brush', onchange: (e) => { ui.brush = clamp(parseFloat(e.target.value) || 2, 0.1, 30); e.target.value = ui.brush; draw(); } })),
@@ -596,7 +614,7 @@
       }
       if (r) {
         ctx.fillStyle = 'rgba(191,217,242,.4)'; ctx.fill(r.cutPath);
-        ctx.fillStyle = '#fff'; ctx.fill(r.whitePath, 'evenodd');
+        fillWhite(ctx, r);
         ctx.globalAlpha = 0.25; drawImages(ctx, d.images); ctx.globalAlpha = 1;
         ctx.save(); ctx.clip(r.cutPath); ctx.fillStyle = '#fff';
         drawImages(ctx, d.images); ctx.restore();
@@ -604,7 +622,7 @@
     }
     if (V === 'white' && r) {
       ctx.fillStyle = '#23272D'; ctx.fill(r.cutPath); ctx.strokeStyle = '#9AA3AF'; ctx.lineWidth = px; ctx.stroke(r.cutPath);
-      ctx.fillStyle = hex(d.white.color); ctx.fill(r.whitePath, 'evenodd');
+      for (const b of r.whiteBands) { ctx.fillStyle = hex(C.tint(d.white.color, b.density)); ctx.fill(b.full, 'evenodd'); }
     }
     if (V === 'white' || V === 'check' || ui.tool.startsWith('protect')) drawProtect(d);
     if (r && V !== 'white') { ctx.strokeStyle = hex(d.cut.color); ctx.lineWidth = Math.max(d.cut.strokeMm, 1.5 * px); ctx.stroke(r.cutPath); }
@@ -840,7 +858,7 @@
     for (let i = 0; i < layers; i++) {
       const first = i === 0, lastL = i === layers - 1;
       const c = layer((x) => {
-        if (lastL) { x.fillStyle = 'rgba(225,238,250,.16)'; x.fill(r.cutPath); x.save(); x.clip(r.cutPath); x.fillStyle = '#fff'; x.fill(r.whitePath, 'evenodd'); drawImages(x, d.images); x.restore(); }
+        if (lastL) { x.fillStyle = 'rgba(225,238,250,.16)'; x.fill(r.cutPath); x.save(); x.clip(r.cutPath); fillWhite(x, r); drawImages(x, d.images); x.restore(); }
         else if (first) { x.fillStyle = 'rgba(191,217,242,.30)'; x.fill(r.cutPath); }
         x.strokeStyle = first || lastL ? 'rgba(255,255,255,.9)' : 'rgba(110,152,196,.30)'; x.lineWidth = first || lastL ? 0.4 : 0.7; x.save(); x.clip(r.cutPath); x.stroke(r.cutPath); x.restore();
       });
@@ -904,6 +922,8 @@
         const base = newDesign(), d = merge(base, { ...jd, images: [] });
         d.id = freshId(jd.id, 'd');
         d.cut.color = cleanColor(d.cut.color, base.cut.color); d.white.color = cleanColor(d.white.color, base.white.color);
+        if (!['none', 'full', 'auto', 'tone'].includes(d.white.mode)) d.white.mode = base.white.mode;
+        d.white.opaqueThreshold = clamp(d.white.opaqueThreshold, 0.5, 1); d.white.minAlpha = clamp(d.white.minAlpha, 0.03, 0.45); d.white.toneSteps = clamp(Math.round(d.white.toneSteps), 2, 10);
         d.white.ops = d.white.ops.filter((o) => o && (o.kind === 'protect-rect' ? fin(o.x, o.y, o.w, o.h) : ['add', 'erase', 'protect-brush'].includes(o.kind) && fin(o.r) && Array.isArray(o.pts) && o.pts.length && o.pts.every((p) => Array.isArray(p) && fin(p[0], p[1]))));
         for (const ji of jd.images || []) {
           if (typeof ji.src !== 'string' || !/^data:image\/(png|jpeg|webp);/.test(ji.src)) throw new Error('이미지 데이터가 없거나 형식이 달라요');
@@ -982,9 +1002,14 @@
       else if (!r.cutOutPlate && !r.cutOutSafe) add('ok', `판 크기 ${P.plate.w}×${P.plate.h} mm, 1:1 실제 크기`, `이미지와 칼선이 안전 여백 ${P.plate.safeMargin}mm 안쪽에 있어요`);
       if (!r.hasWhite) add('warn', '화이트가 없어요', d.white.mode === 'none' ? '화이트 방식이 "없음"이에요.' : '불투명한 부분이 없어요. 불투명 기준을 낮춰 보세요.');
       else {
-        if (r.overlap) add('warn', `화이트가 반투명·투명 부분에 겹친 픽셀 ${r.overlap.toLocaleString()}개`, d.white.mode === 'full' ? '전체 채움이라 의도한 결과면 괜찮아요.' : '화이트 크기를 줄이거나 추가로 칠한 곳을 확인해 주세요.', r.overBoxes, 'check');
-        else add('ok', '화이트가 반투명·투명 부분에 겹친 픽셀 0개');
-        if (d.white.mode === 'auto') add(r.gap >= 0 ? 'ok' : 'warn', `불투명 경계에서 화이트까지 최소 간격 ${r.gap.toFixed(2)} mm`, r.gap < 0 ? '화이트가 불투명 경계를 넘었어요.' : null);
+        const tone = d.white.mode === 'tone', where = tone ? '시작 불투명도보다 투명한' : '반투명·투명';
+        if (tone) {
+          if (toRgb(d.white.color).every((v) => v > 0.999)) add('warn', '화이트 색이 흰색이라 농도 차이가 없어져요', '화이트 색상을 C100처럼 색이 있는 값으로 바꿔 주세요.');
+          else add('warn', '투명도별 화이트를 써요', '인쇄소가 옅은 화이트 색을 농도로 읽는지 확인해 주세요. 화이트는 벡터 면으로만 들어가요.');
+        }
+        if (r.overlap) add('warn', `화이트가 ${where} 부분에 겹친 픽셀 ${r.overlap.toLocaleString()}개`, d.white.mode === 'full' ? '전체 채움이라 의도한 결과면 괜찮아요.' : '화이트 크기를 줄이거나 추가로 칠한 곳을 확인해 주세요.', r.overBoxes, 'check');
+        else add('ok', `화이트가 ${where} 부분에 겹친 픽셀 0개`);
+        if (tone || d.white.mode === 'auto') add(r.gap >= 0 ? 'ok' : 'warn', `${tone ? '시작 불투명도' : '불투명'} 경계에서 화이트까지 최소 간격 ${r.gap.toFixed(2)} mm`, r.gap < 0 ? '화이트가 경계를 넘었어요.' : null);
         if (r.thinCount) add('warn', `0.3mm 미만으로 가는 화이트 ${r.thinCount}곳`, '인쇄가 안 될 수 있어요. 해당 부분을 보호 영역으로 지정하거나 줄이기를 낮춰 보세요.', r.thinBoxes, 'white');
         else add('ok', '0.3mm 미만으로 가는 화이트가 없어요');
       }

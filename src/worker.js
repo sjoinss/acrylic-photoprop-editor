@@ -22,7 +22,7 @@ const handlers = {
   asset(m) { assets.set(m.id, { w: m.w, h: m.h, data: new Uint8ClampedArray(m.buf) }); return {}; },
   preview({ design, plate, wantCheck }) {
     const r = pipeline(design, plate, C.pickPpm(plate, 1.5e6, 20), memo);
-    const out = { g: r.g, cut: r.cut.loops, white: r.white.loops, removed: r.cut.removed, removedBoxes: r.cut.removedBoxes };
+    const out = { g: r.g, cut: r.cut.loops, white: r.white.loops, levels: r.white.levels, removed: r.cut.removed, removedBoxes: r.cut.removedBoxes };
     if (wantCheck) out.check = C.checkRaster(r.d, r.g, r.alpha, r.cut, r.white).buffer;
     return out;
   },
@@ -32,7 +32,7 @@ const handlers = {
     for (const design of designs) {
       const r = pipeline(design, plate, C.pickPpm(plate, 6e6, 20), {});
       reports.push({ id: design.id, ...C.verify(r.d, plate, r.g, r.alpha, r.cut, r.white) });
-      exportMemo.pages.push({ design: r.d, cutCurves: r.cut.curves, whiteLoops: r.white.loops });
+      exportMemo.pages.push({ design: r.d, cutCurves: r.cut.curves, whiteLevels: r.white.levels });
     }
     return { reports };
   },

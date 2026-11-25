@@ -607,19 +607,46 @@
     for (let j = 0; j < best.length; j++) if (best[j] > -1e5) fn((Y0 + Math.floor(j / W)) * g.w + X0 + (j % W), best[j]);
   }
 
-  /** 반환: { field, loops(mm) } */
+  /** 화이트가 들어갈 수 있는 가장 낮은 알파 */
+  const whiteMin = (wh) => (wh.mode === 'tone' ? Math.min(wh.minAlpha, wh.opaqueThreshold - 0.01) : wh.opaqueThreshold) - 1e-6;
+
+  /** 농도 단계: 아래(옅음)부터. 마지막은 불투명 = 100% */
+  function toneSteps(wh) {
+    const n = Math.max(2, Math.min(10, Math.round(wh.toneSteps))), lo = whiteMin(wh) + 1e-6, hi = wh.opaqueThreshold;
+    const at = (k) => lo + (hi - lo) * k / (n - 1);
+    return Array.from({ length: n }, (_, k) => ({
+      min: at(k) - 1e-6, density: k === n - 1 ? 1 : Math.max(1, Math.round((at(k) + at(k + 1)) * 50)) / 100,
+    }));
+  }
+
+  /** 단계별 마스크. 불투명 경계의 가는 안티에일리어싱 테두리는 옅은 화이트로 만들지 않아요. */
+  function toneMasks(wh, g, alpha, steps) {
+    const { w, h, ppm } = g, N = w * h, thr = wh.opaqueThreshold - 1e-6, lo = steps[0].min;
+    const semi = new Uint8Array(N);
+    for (let i = 0; i < N; i++) semi[i] = alpha[i] >= lo && alpha[i] < thr ? 1 : 0;
+    const r = Math.max(1, 0.15 * ppm), core = opening(semi, w, h, r), near = dilate(core, w, h, r + 1);
+    const soft = boxBlur(alpha, w, h, Math.max(1, Math.round(0.1 * ppm))); // 잡티로 경로가 잘게 부서지지 않게
+    return steps.map((st, k) => {
+      const m = new Uint8Array(N), top = k === steps.length - 1;
+      for (let i = 0; i < N; i++) m[i] = alpha[i] >= thr || (!top && semi[i] && near[i] && (k === 0 || soft[i] >= st.min)) ? 1 : 0;
+      return m;
+    });
+  }
+
+  /**
+   * 반환: { field, loops(mm), tone, levels: [{ density, loops }] }
+   * levels는 옅은 것부터이고 위 단계가 아래 단계 안에 포개져요. 순서대로 불투명하게 칠하면 이음새가 생기지 않아요.
+   * field·loops는 가장 넓은 단계, tone은 픽셀별 농도(0~100)예요.
+   */
   function buildWhite(design, g, alpha, cutSdf) {
-    const wh = design.white, { w, h, ppm } = g, N = w * h;
-    const F = new Float32Array(N), ops = wh.ops || [];
-    if (wh.mode === 'none') return { field: F.fill(-1), loops: [] };
-    if (wh.mode === 'full') {
-      for (let i = 0; i < N; i++) F[i] = -cutSdf[i] + wh.sizeOffset * ppm; // 음수 = 줄이기
-    } else {
-      const opaque = new Uint8Array(N);
-      for (let i = 0; i < N; i++) opaque[i] = alpha[i] >= wh.opaqueThreshold - 1e-6 ? 1 : 0;
-      const s = sdf(opaque, w, h);
-      const protect = new Uint8Array(N);
-      for (const op of ops) if (op.kind.startsWith('protect')) eachOpPixel(op, g, (i, v) => { if (v > 0) protect[i] = 1; });
+    const wh = design.white, { w, h, ppm } = g, N = w * h, ops = wh.ops || [];
+    const tone = new Uint8Array(N);
+    if (wh.mode === 'none') return { field: new Float32Array(N).fill(-1), loops: [], tone, levels: [] };
+    const protect = new Uint8Array(N);
+    if (wh.mode !== 'full') for (const op of ops) if (op.kind.startsWith('protect')) eachOpPixel(op, g, (i, v) => { if (v > 0) protect[i] = 1; });
+
+    const fromMask = (mask) => {
+      const F = new Float32Array(N), s = sdf(mask, w, h);
       for (let i = 0; i < N; i++) F[i] = -s[i] + (protect[i] ? wh.protectOffset : wh.sizeOffset) * ppm;
       const bin = new Uint8Array(N);
       for (let i = 0; i < N; i++) bin[i] = F[i] > 0 ? 1 : 0;
@@ -632,18 +659,45 @@
         const bl = boxBlur(F, w, h, Math.round(wh.smooth));
         for (let i = 0; i < N; i++) if (!protect[i]) F[i] = Math.min(bl[i], F[i]);
       }
+      return F;
+    };
+    const finish = (F, density) => {
+      for (const op of ops) {
+        if (op.kind === 'add') eachOpPixel(op, g, (i, v) => { if (v > F[i]) F[i] = v; });
+        else if (op.kind === 'erase') eachOpPixel(op, g, (i, v) => { if (-v < F[i]) F[i] = -v; });
+      }
+      for (let i = 0; i < N; i++) {
+        F[i] = Math.min(F[i], -cutSdf[i]);
+        if (F[i] > 0) tone[i] = Math.round(density * 100);
+      }
+      return { F, level: { density, loops: contoursMm(F, g, 0.015) } };
+    };
+
+    const out = [];
+    if (wh.mode === 'full') {
+      const F = new Float32Array(N);
+      for (let i = 0; i < N; i++) F[i] = -cutSdf[i] + wh.sizeOffset * ppm; // 음수 = 줄이기
+      out.push(finish(F, 1));
+    } else if (wh.mode === 'tone') {
+      const steps = toneSteps(wh);
+      let field = null;
+      toneMasks(wh, g, alpha, steps).forEach((m, k) => {
+        const r = finish(fromMask(m), steps[k].density);
+        field = field || r.F;
+        out.push({ F: null, level: r.level });
+      });
+      out[0].F = field;
+    } else {
+      const opaque = new Uint8Array(N);
+      for (let i = 0; i < N; i++) opaque[i] = alpha[i] >= wh.opaqueThreshold - 1e-6 ? 1 : 0;
+      out.push(finish(fromMask(opaque), 1));
     }
-    for (const op of ops) {
-      if (op.kind === 'add') eachOpPixel(op, g, (i, v) => { if (v > F[i]) F[i] = v; });
-      else if (op.kind === 'erase') eachOpPixel(op, g, (i, v) => { if (-v < F[i]) F[i] = -v; });
-    }
-    for (let i = 0; i < N; i++) F[i] = Math.min(F[i], -cutSdf[i]);
-    return { field: F, loops: contoursMm(F, g, 0.015) };
+    return { field: out[0].F, loops: out[0].level.loops, tone, levels: out.map((o) => o.level).filter((l) => l.loops.length) };
   }
 
   // ---------- 검증 ----------
   function verify(design, plate, g, alpha, cut, white) {
-    const { w, h, ppm } = g, N = w * h, thr = design.white.opaqueThreshold - 1e-6, F = white.field;
+    const { w, h, ppm } = g, N = w * h, thr = whiteMin(design.white), F = white.field;
     let overlap = 0;
     const bin = new Uint8Array(N), opq = new Uint8Array(N), over = new Uint8Array(N);
     for (let i = 0; i < N; i++) {
@@ -687,10 +741,11 @@
   }
   /** '화이트 확인' 화면용 RGBA */
   function checkRaster(design, g, alpha, cut, white) {
-    const out = new Uint8ClampedArray(g.w * g.h * 4), thr = design.white.opaqueThreshold - 1e-6;
+    const out = new Uint8ClampedArray(g.w * g.h * 4), thr = design.white.opaqueThreshold - 1e-6, lo = whiteMin(design.white);
+    const gray = (t) => { const v = Math.round(70 + 185 * t / 100); return (v << 16) | (v << 8) | v; };
     for (let i = 0; i < alpha.length; i++) {
       let c = 0x000000;
-      if (white.field[i] > 0) c = alpha[i] >= thr ? 0xffffff : 0xff2fb3;
+      if (white.field[i] > 0) c = alpha[i] >= lo ? gray(white.tone[i]) : 0xff2fb3;
       else if (alpha[i] >= thr) c = 0x7a8594;
       else if (alpha[i] > 0.02) c = 0xffd84d;
       out[i * 4] = c >> 16; out[i * 4 + 1] = (c >> 8) & 255; out[i * 4 + 2] = c & 255; out[i * 4 + 3] = 255;
@@ -747,6 +802,8 @@
   }
   const colorOp = (c, stroke) => c.v.map(fmt).join(' ') + ' ' +
     (c.space === 'cmyk' ? (stroke ? 'K' : 'k') : (stroke ? 'RG' : 'rg'));
+  /** 화이트 농도: 투명도를 쓰지 않고 색 값만 종이색 쪽으로 옅게 */
+  const tint = (c, d) => ({ space: c.space, v: c.v.map((v) => (c.space === 'cmyk' ? v * d : 1 - (1 - v) * d)) });
   function pathOps(loops, plateH) {
     const out = [];
     for (const l of loops) {
@@ -805,7 +862,7 @@
       ...(c.segs[c.segs.length - 1].length === 6 ? [xy(c.segs[c.segs.length - 1]) + ' c'] : []), 'h'].join('\n')).join('\n');
   }
 
-  /** pages: [{ design, cutCurves, whiteLoops }], design.images[].pixels 또는 .jpeg({w,h,bytes}) */
+  /** pages: [{ design, cutCurves, whiteLoops | whiteLevels }], design.images[].pixels 또는 .jpeg({w,h,bytes}) */
   async function buildPdf({ plate, layers, pages }) {
     const enc = new TextEncoder(), objs = [null];
     const alloc = () => objs.push(null) - 1;
@@ -833,10 +890,12 @@
       ocUse.set(k, (ocUse.get(k) || new Set()).add(merged ? ocgs[1] : ocgs[1 + i]));
     });
     let n = 0;
-    for (const { design, cutCurves, whiteLoops } of pages) {
+    for (const { design, cutCurves, whiteLoops, whiteLevels } of pages) {
       const props = new Map([['OCW', whiteOc], ['OCC', cutOc]]), xobjs = [];
       let cs = '';
-      if (whiteLoops.length) cs += `/OC /OCW BDC\nq\n${colorOp(design.white.color, false)}\n${pathOps(whiteLoops, plate.h)}\nf*\nQ\nEMC\n`;
+      // 화이트는 농도 단계가 있어도 이미지·투명도·별색 없이 벡터 면만 써요(포함할 외부 자원이 없음).
+      const levels = (whiteLevels || [{ density: 1, loops: whiteLoops }]).filter((l) => l.loops.length);
+      if (levels.length) cs += `/OC /OCW BDC\nq\n${levels.map((l) => `${colorOp(tint(design.white.color, l.density), false)}\n${pathOps(l.loops, plate.h)}\nf*\n`).join('')}Q\nEMC\n`;
       for (const im of design.images) {
         const oc = merged ? ocgs[1] : ocgs[1 + n], key = 'OCI' + (merged ? 0 : n), name = 'Im' + n;
         n++;
@@ -905,7 +964,7 @@
   const api = {
     makeGrid, gridForCut, pickPpm, toMm, edt, dilate, erode, closing, opening, sdf, label, fillHoles, keepLargest,
     boxBlur, marchingSquares, simplifyClosed, contoursMm, imageAABB, unionBox, rasterAlpha, stickRect,
-    flattenCurve, maxDeviation, buildCut, buildWhite, verify, checkRaster, resizePixels, buildPdf, imageMatrix, srgbIcc, uniqueNames, pngUp, deflate,
+    flattenCurve, maxDeviation, buildCut, buildWhite, toneSteps, tint, verify, checkRaster, resizePixels, buildPdf, imageMatrix, srgbIcc, uniqueNames, pngUp, deflate,
   };
   root.PhotopropCore = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

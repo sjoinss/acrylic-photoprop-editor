@@ -266,3 +266,43 @@ test('PDF: 여러 페이지 + 이미지별 레이어 + 불투명 이미지', asy
   assert.deepEqual(names, ['화이트', '앞', '앞 2', '이미지3', '칼선']);
   assert.equal((txt.match(/\/Type\/Page\//g) || []).length, 2);
 });
+
+test('투명도별 화이트: 단계·포개짐·벡터 전용 PDF', async () => {
+  const n = 512, data = new Uint8ClampedArray(n * n * 4);
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) data.set([200, 90, 40, x / (n - 1) * 255], (y * n + x) * 4);
+  const d = makeDesign({ white: { mode: 'tone', minAlpha: 0.1, toneSteps: 6, sizeOffset: 0 } });
+  d.images[0].pixels = { w: n, h: n, data };
+  const r = run(d, 10), L = r.white.levels;
+  assert.equal(L.length, 6);
+  assert.equal(L[5].density, 1);
+  const ar = L.map((l) => l.loops.reduce((s, q) => s + area(q), 0));
+  for (let i = 1; i < 6; i++) { assert.ok(L[i].density > L[i - 1].density); assert.ok(ar[i] < ar[i - 1]); }
+  for (let y = 150; y < 650; y++) for (let x = 120; x < 660; x++) {
+    const i = (y + 4) * r.g.w + x; if (r.white.tone[i]) assert.ok(Math.abs(r.white.tone[i] / 100 - r.alpha[i]) < 0.12);
+  }
+  assert.equal(C.verify(d, plate, r.g, r.alpha, r.cut, r.white).overlap, 0);
+
+  // 선명한 이미지의 가장자리에는 옅은 테두리가 생기지 않아요.
+  const hard = makeDesign({ white: { mode: 'tone', minAlpha: 0.1, toneSteps: 6 } });
+  const disc = new Uint8ClampedArray(n * n * 4);
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) disc.set([9, 9, 9, Math.max(0, Math.min(1, 200 - Math.hypot(x - 256, y - 256))) * 255], (y * n + x) * 4);
+  hard.images[0].pixels = { w: n, h: n, data: disc };
+  for (const ppm of [8, 20]) { const t = run(hard, ppm).white.tone; assert.ok(t.every((v) => v === 0 || v === 100), 'ppm ' + ppm); }
+
+  // 반투명 고리는 가운데 농도로 들어가요.
+  const ring = makeDesign({ white: { mode: 'tone', minAlpha: 0.1, toneSteps: 6 } }), rr = run(ring, 10);
+  assert.ok([...new Set(rr.white.tone)].some((v) => v >= 40 && v <= 60));
+
+  const pdf = await C.buildPdf({ plate, layers, pages: [{ design: d, cutCurves: r.cut.curves, whiteLevels: L }] });
+  fs.mkdirSync(path.join(__dirname, 'out'), { recursive: true });
+  fs.writeFileSync(path.join(__dirname, 'out', 'tone.pdf'), pdf);
+  const txt = Buffer.from(pdf).toString('latin1');
+  const id = +/\/Contents (\d+) 0 R/.exec(txt)[1], at = txt.indexOf(`\n${id} 0 obj`), st = txt.indexOf('stream\n', at) + 7;
+  const cs = zlib.inflateSync(pdf.subarray(st, st + +/\/Length (\d+)/.exec(txt.slice(at))[1])).toString();
+  const white = cs.slice(cs.indexOf('/OC /OCW BDC'), cs.indexOf('EMC'));
+  assert.deepEqual(white.match(/^[\d. ]+ k$/gm), L.map((l) => `${l.density} 0 0 0 k`));
+  assert.ok(!/\b(Do|gs|sh|scn|BI)\b/.test(white), '화이트에 이미지·투명도·그라데이션 없음');
+  assert.equal((txt.match(/\/Subtype\/Image/g) || []).length, 2, '이미지 + SMask뿐');
+  assert.ok(!/\/(ExtGState|Separation|Pattern|Shading)|\/F\s*\(/.test(txt), '외부 참조 없음');
+  assert.deepEqual(C.tint({ space: 'rgb', v: [0, 1, 1] }, 0.5).v, [0.5, 1, 1]);
+});
